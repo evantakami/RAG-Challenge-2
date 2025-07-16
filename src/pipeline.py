@@ -480,7 +480,145 @@ if __name__ == "__main__":
     # This method creates vector databases from the chunked reports
     # New files can be found in databases/vector_dbs
     # pipeline.create_vector_dbs() 
-    
+    import os
+import datetime
+from typing import Annotated, TypedDict
+from dotenv import load_dotenv
+
+# LangGraph コアライブラリ
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+
+# Microsoft Graph SDK
+from msgraph.core import GraphClient
+
+# 重要度分析用 LLM（例：OpenAI Chat）
+from langchain_openai import ChatOpenAI
+
+# 環境変数読み込み
+load_dotenv()
+CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
+TENANT_ID = os.getenv("AZURE_TENANT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TEAMS_ID = os.getenv("TEAMS_ID")
+TEAMS_CHANNEL_ID = os.getenv("TEAMS_CHANNEL_ID")
+
+# ワークフローの共有状態型定義
+class State(TypedDict):
+    messages: Annotated[list, add_messages]   # 取得メッセージ
+    masked: Annotated[list, add_messages]     # マスキング後メッセージ
+    scored: Annotated[list, add_messages]     # 重要度スコア付きメッセージ
+    summary: str                              # 要約文
+    posted: bool                              # 投稿完了フラグ
+
+# Graph API クライアント初期化
+graph_client = GraphClient(credential={
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
+    "tenant_id": TENANT_ID,
+    "authority": f"https://login.microsoftonline.com/{TENANT_ID}"
+})
+
+# 1. Outlook メール取得
+def fetch_outlook(state: State) -> dict:
+    today = datetime.date.today().isoformat()
+    resp = graph_client.get(
+        f"/me/mailFolders/Inbox/messages?$filter=receivedDateTime ge {today}T00:00:00Z"
+    )
+    items = resp.json().get("value", [])
+    msgs = [
+        {"source": "outlook", "id": m["id"], "content": m["body"]["content"]}
+        for m in items
+    ]
+    return {"messages": msgs}
+
+# 2. Teams メッセージ取得
+def fetch_teams(state: State) -> dict:
+    teams = graph_client.get("/me/joinedTeams").json().get("value", [])
+    all_msgs = []
+    for t in teams:
+        channels = graph_client.get(f"/teams/{t['id']}/channels").json().get("value", [])
+        for ch in channels:
+            msgs = graph_client.get(
+                f"/teams/{t['id']}/channels/{ch['id']}/messages"
+            ).json().get("value", [])
+            all_msgs += [
+                {"source": "teams", "id": m["id"], "content": m["body"]["content"]}
+                for m in msgs
+            ]
+    return {"messages": all_msgs}
+
+# 3. データマスキング
+def mask_data(state: State) -> dict:
+    masked = []
+    import re
+    for m in state["messages"]:
+        content = m["content"]
+        # メールアドレスと電話番号をマスク
+        content = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", "[EMAIL]", content)
+        content = re.sub(r"\b\d{2,4}-\d{2,4}-\d{4}\b", "[PHONE]", content)
+        masked.append({**m, "content": content})
+    return {"masked": masked}
+
+# 4. 重要度分析
+def analyze_importance(state: State) -> dict:
+    llm = ChatOpenAI(temperature=0)
+    scored = []
+    for m in state["masked"]:
+        prompt = (
+            "以下のメッセージについて重要度を1～5で評価し、理由を日本語で簡潔に説明してください。\n\n"
+            f"{m['content']}\n\n"
+            "結果は JSON 形式で {\"score\":int, \"reason\":str} として返してください。"
+        )
+        resp = llm.invoke([{"role": "user", "content": prompt}])
+        result = resp.content  # 例: {"score":3,"reason":"..."}
+        scored.append({**m, **eval(result)})
+    return {"scored": scored}
+
+# 5. ソート＆要約生成
+def sort_summarize(state: State) -> dict:
+    sorted_msgs = sorted(state["scored"], key=lambda x: x["score"], reverse=True)
+    top5 = sorted_msgs[:5]
+    summary = "📋 今日の重要メッセージ TOP5：\n" + "\n".join(
+        f"{i+1}. [{m['source']}] {m['content'][:50]}... (Score:{m['score']})"
+        for i, m in enumerate(top5)
+    )
+    return {"summary": summary}
+
+# 6. Teams へ投稿
+def post_to_teams(state: State) -> dict:
+    graph_client.post(
+        f"/teams/{TEAMS_ID}/channels/{TEAMS_CHANNEL_ID}/messages",
+        json={"body": {"content": state["summary"]}}
+    )
+    return {"posted": True}
+
+# StateGraph の構築と実行順序定義
+builder = StateGraph(State, checkpoint=MemorySaver())
+builder.add_node("fetch_outlook", fetch_outlook)
+builder.add_node("fetch_teams", fetch_teams)
+builder.add_node("mask_data", mask_data)
+builder.add_node("analyze_importance", analyze_importance)
+builder.add_node("sort_summarize", sort_summarize)
+builder.add_node("post_to_teams", post_to_teams)
+
+builder.add_edge(START, "fetch_outlook")
+builder.add_edge("fetch_outlook", "fetch_teams")
+builder.add_edge("fetch_teams", "mask_data")
+builder.add_edge("mask_data", "analyze_importance")
+builder.add_edge("analyze_importance", "sort_summarize")
+builder.add_edge("sort_summarize", "post_to_teams")
+builder.add_edge("post_to_teams", END)
+
+graph = builder.compile()
+
+if __name__ == "__main__":
+    # cron や Airflow などで毎朝実行
+    result = graph.invoke({"messages": []})
+    print("ワークフロー完了、posted =", result["posted"])
+
     
     # This method processes the questions and answers
     # Questions processing logic depends on the run_config
